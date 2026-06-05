@@ -1,0 +1,6 @@
+opencv-python
+mediapipe
+google-generativeai
+google-cloud-texttospeech
+pyaudio
+pyautogui
