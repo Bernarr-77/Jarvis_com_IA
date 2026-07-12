@@ -22,10 +22,15 @@ class RastreadorDeMaos:
         return resultados.multi_hand_landmarks
 
     def desenhar_maos(self, frame: np.ndarray, maos_detectadas: List) -> None:
+        # Estilo Iron Man — ciano brilhante + conexões brancas finas
+        estilo_ponto = mp_drawing.DrawingSpec(color=(255, 255, 0), thickness=2, circle_radius=3)
+        estilo_conexao = mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=1)
 
         for landmarks in maos_detectadas:
             mp_drawing.draw_landmarks(
                 frame, 
                 landmarks, 
-                mp_hands.HAND_CONNECTIONS
+                mp_hands.HAND_CONNECTIONS,
+                estilo_ponto,
+                estilo_conexao
             )

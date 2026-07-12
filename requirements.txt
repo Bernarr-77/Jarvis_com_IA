@@ -1,6 +1,10 @@
 opencv-python
 mediapipe
-google-generativeai
-google-cloud-texttospeech
+google-genai
 pyaudio
 pyautogui
+pygame
+python-dotenv
+SpeechRecognition
+fishaudio
+Pillow
