@@ -1,14 +1,15 @@
 """
-Gerenciador de sessão Gemini Live API.
+Gerenciador de sessão Gemini Live API (WebSocket contínuo).
 
 Mantém uma conexão WebSocket persistente com o Gemini,
-enviando frames da câmera continuamente e recebendo
-respostas em texto quando solicitado via enviar_texto().
+enviando frames da câmera continuamente. Quando o usuário
+fala, o Gemini responde em áudio nativo (que ignoramos)
+e nos entrega a transcrição em texto, que é repassada
+ao Fish Audio TTS para gerar a voz do JARVIS.
 """
 import asyncio
 import threading
 import logging
-import queue
 from typing import Callable, Optional
 
 import cv2
@@ -24,7 +25,8 @@ class GeminiLiveSession:
     Responsabilidades:
         - Enviar frames da câmera (~1 FPS) para contexto visual contínuo
         - Receber perguntas via enviar_texto() e encaminhar ao modelo
-        - Notificar respostas completas via callback
+        - Capturar a transcrição do áudio de resposta do Gemini
+        - Notificar respostas completas via callback (texto para o TTS)
     
     Thread Safety:
         - atualizar_frame() e enviar_texto() são thread-safe
@@ -38,7 +40,8 @@ class GeminiLiveSession:
         self._client = genai.Client(api_key=api_key)
         self._instrucao_sistema = instrucao_sistema
         self._config = types.LiveConnectConfig(
-            response_modalities=["TEXT"],
+            response_modalities=["AUDIO"],
+            output_audio_transcription=types.AudioTranscriptionConfig(),
             system_instruction=types.Content(
                 parts=[types.Part(text=instrucao_sistema)]
             ),
@@ -60,8 +63,7 @@ class GeminiLiveSession:
         """Inicia a sessão Live em uma thread daemon.
         
         Args:
-            on_response: Callback chamado com o texto completo de cada resposta do Gemini.
-                         Será chamado a partir da thread do asyncio.
+            on_response: Callback chamado com o texto transcrito de cada resposta.
         """
         self._on_response = on_response
         self._ativo = True
@@ -75,21 +77,13 @@ class GeminiLiveSession:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
     def atualizar_frame(self, frame) -> None:
-        """Thread-safe: atualiza o frame mais recente da câmera.
-        
-        Args:
-            frame: Frame OpenCV (numpy array BGR).
-        """
+        """Thread-safe: atualiza o frame mais recente da câmera."""
         _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         with self._lock_frame:
             self._ultimo_frame = buffer.tobytes()
 
     def enviar_texto(self, texto: str) -> None:
-        """Thread-safe: envia uma pergunta/comando ao Gemini.
-        
-        Args:
-            texto: Texto a ser enviado (ex: frase do usuário após "Jarvis").
-        """
+        """Thread-safe: envia uma pergunta/comando ao Gemini."""
         if self._loop and self._fila_texto:
             self._loop.call_soon_threadsafe(self._fila_texto.put_nowait, texto)
 
@@ -102,7 +96,7 @@ class GeminiLiveSession:
         try:
             self._loop.run_until_complete(self._loop_sessao())
         except Exception as e:
-            logger.error(f"Sessão Gemini Live encerrada com erro: {e}")
+            logger.error(f"Sessao Gemini Live encerrada com erro: {e}")
         finally:
             self._loop.close()
 
@@ -115,11 +109,14 @@ class GeminiLiveSession:
             model=self.MODELO,
             config=self._config
         ) as session:
-            logger.info("Sessão Gemini Live conectada!")
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._enviar_frames(session))
-                tg.create_task(self._enviar_textos(session))
-                tg.create_task(self._receber_respostas(session))
+            logger.info("Sessao Gemini Live conectada! Visao em tempo real ativa.")
+            
+            # Rodar as 3 tarefas em paralelo
+            enviar_frames_task = asyncio.create_task(self._enviar_frames(session))
+            enviar_textos_task = asyncio.create_task(self._enviar_textos(session))
+            receber_task = asyncio.create_task(self._receber_respostas(session))
+            
+            await asyncio.gather(enviar_frames_task, enviar_textos_task, receber_task)
 
     async def _enviar_frames(self, session) -> None:
         """Envia o frame mais recente da câmera ao Gemini a cada ~1/FPS_ENVIO segundos."""
@@ -131,7 +128,7 @@ class GeminiLiveSession:
             if frame_jpeg:
                 try:
                     await session.send_realtime_input(
-                        media=types.Blob(data=frame_jpeg, mime_type="image/jpeg")
+                        video=types.Blob(data=frame_jpeg, mime_type="image/jpeg")
                     )
                 except Exception as e:
                     logger.warning(f"Erro ao enviar frame: {e}")
@@ -155,23 +152,56 @@ class GeminiLiveSession:
                 logger.error(f"Erro ao enviar texto ao Gemini: {e}")
 
     async def _receber_respostas(self, session) -> None:
-        """Recebe mensagens do Gemini e acumula texto até o fim do turno."""
-        partes_resposta = []
+        """Recebe mensagens do Gemini e captura a transcrição do áudio gerado.
+        
+        O Gemini responde em áudio nativo (que ignoramos), mas junto
+        vem a transcrição em texto via output_audio_transcription.
+        Esse texto é o que enviamos ao Fish Audio para falar com a voz do JARVIS.
+        """
+        partes_transcricao = []
 
         while self._ativo:
             try:
                 async for msg in session.receive():
-                    if msg.text:
-                        partes_resposta.append(msg.text)
+                    # Debug: mostra todos os atributos da mensagem
+                    attrs = [a for a in dir(msg) if not a.startswith('_')]
+                    logger.debug(f"MSG attrs: {attrs}")
+
+                    # Tenta pegar transcrição diretamente da mensagem
+                    if hasattr(msg, 'text') and msg.text:
+                        logger.info(f"[transcricao via msg.text]: {msg.text}")
+                        partes_transcricao.append(msg.text)
 
                     server_content = getattr(msg, 'server_content', None)
-                    turn_complete = getattr(server_content, 'turn_complete', False) if server_content else False
+                    if server_content:
+                        # Debug: mostra atributos do server_content
+                        sc_attrs = [a for a in dir(server_content) if not a.startswith('_')]
+                        logger.debug(f"SC attrs: {sc_attrs}")
 
-                    if turn_complete:
-                        texto_completo = "".join(partes_resposta).strip()
-                        if texto_completo and self._on_response:
-                            self._on_response(texto_completo)
-                        partes_resposta = []
+                        # Tenta via output_transcription
+                        transcricao = getattr(server_content, 'output_transcription', None)
+                        if transcricao:
+                            t_text = getattr(transcricao, 'text', None)
+                            logger.info(f"[transcricao via output_transcription]: '{t_text}'")
+                            if t_text:
+                                partes_transcricao.append(t_text)
+
+                        # Tenta via model_turn (fallback)
+                        model_turn = getattr(server_content, 'model_turn', None)
+                        if model_turn:
+                            for part in getattr(model_turn, 'parts', []):
+                                if hasattr(part, 'text') and part.text:
+                                    logger.info(f"[transcricao via model_turn]: {part.text}")
+                                    partes_transcricao.append(part.text)
+
+                        # Quando o turno termina, junta toda a transcrição e notifica
+                        turn_complete = getattr(server_content, 'turn_complete', False)
+                        if turn_complete:
+                            texto_completo = "".join(partes_transcricao).strip()
+                            logger.info(f"[turno completo] texto final: '{texto_completo}'")
+                            if texto_completo and self._on_response:
+                                self._on_response(texto_completo)
+                            partes_transcricao = []
 
             except Exception as e:
                 logger.error(f"Erro ao receber resposta: {e}")
